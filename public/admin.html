@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rokugard · Admin</title>
+  <style>
+    :root { --bg:#0e0b12; --panel:#1a1422; --line:#3a2d4a; --ink:#f4ecff; --muted:#b9a8cc; --gold:#e2b84a; --good:#6fbf73; --bad:#e25b5b; --accent:#9b6bff; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:15px/1.45 "Segoe UI",system-ui,sans-serif; background:radial-gradient(1200px 500px at 10% -10%, #3a1d63 0%, transparent 50%), var(--bg); color:var(--ink); }
+    header { display:flex; justify-content:space-between; align-items:center; padding:18px 24px; border-bottom:1px solid var(--line); }
+    header strong { color:var(--gold); letter-spacing:.08em; }
+    main { max-width:1100px; margin:0 auto; padding:24px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:20px; margin-bottom:16px; }
+    h1 { font-size:22px; margin:0 0 8px; } h2 { font-size:16px; margin:0 0 12px; color:var(--gold); }
+    p, label { color:var(--muted); }
+    input, textarea, button, select { font:inherit; border-radius:10px; border:1px solid var(--line); padding:10px 12px; }
+    input, textarea, select { width:100%; background:#120e18; color:var(--ink); }
+    button { background:var(--accent); color:white; border:0; cursor:pointer; }
+    button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+    button.danger { background:var(--bad); }
+    .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+    .tabs { display:flex; gap:8px; margin-bottom:16px; }
+    .tabs button[aria-current="true"] { background:var(--gold); color:#1a1204; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; }
+    .on { background:#1e3a24; color:var(--good); } .off { background:#3a1e1e; color:var(--bad); }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    @media (max-width:800px) { .grid { grid-template-columns:1fr; } }
+    .hidden { display:none; } .codes { font-family:ui-monospace,monospace; white-space:pre-wrap; }
+  </style>
+</head>
+<body>
+  <header><div><strong>ROKUGARD</strong> · panel</div><div id="who"></div></header>
+  <main>
+    <section id="login" class="card">
+      <h1>Entrar</h1>
+      <p>Usa <code>roku@waruchan.com</code> y la clave del servidor.</p>
+      <div class="grid">
+        <label>Email<input id="email" type="email" value="roku@waruchan.com" /></label>
+        <label>Clave<input id="password" type="password" /></label>
+      </div>
+      <p><button id="btnLogin">Entrar</button></p>
+      <p id="loginErr"></p>
+    </section>
+    <section id="app" class="hidden">
+      <div class="tabs">
+        <button data-tab="estado" aria-current="true">Estado</button>
+        <button data-tab="usuarios">Usuarios</button>
+        <button data-tab="codigos">Códigos</button>
+        <button class="ghost" id="btnOut">Salir</button>
+      </div>
+      <section data-panel="estado" class="card">
+        <h2>Beta y versión</h2>
+        <div class="grid">
+          <label>Beta abierta<select id="betaOpen"><option value="false">Cerrada</option><option value="true">Abierta</option></select></label>
+          <label>Registro abierto<select id="registrationOpen"><option value="false">No</option><option value="true">Sí</option></select></label>
+          <label>Mantenimiento<select id="maintenance"><option value="false">No</option><option value="true">Sí</option></select></label>
+          <label>Mensaje<input id="maintenanceMsg" /></label>
+          <label>Versión mínima<input id="minVersion" /></label>
+          <label>Última versión<input id="latestVersion" /></label>
+          <label>URL del APK<input id="apkUrl" /></label>
+        </div>
+        <p><button id="btnSave">Guardar</button> <span id="saveMsg"></span></p>
+        <p id="stats"></p>
+      </section>
+      <section data-panel="usuarios" class="card hidden">
+        <h2>Usuarios</h2>
+        <div class="row"><input id="userQ" placeholder="Buscar email o nombre" /><button id="btnSearch">Buscar</button></div>
+        <div style="overflow:auto"><table id="userTable"></table></div>
+      </section>
+      <section data-panel="codigos" class="card hidden">
+        <h2>Códigos de bundle</h2>
+        <div class="row"><input id="codeCount" type="number" min="1" max="50" value="5" style="width:90px" /><button id="btnGen">Generar</button></div>
+        <p class="codes" id="newCodes"></p>
+        <div style="overflow:auto"><table id="codeTable"></table></div>
+      </section>
+    </section>
+  </main>
+<script>
+const $ = (id) => document.getElementById(id);
+const api = (path, opt = {}) => fetch(path, { credentials:"include", headers:{ "content-type":"application/json" }, ...opt })
+  .then(async (r) => ({ ok:r.ok, status:r.status, data: await r.json().catch(() => ({})) }));
+function tab(name) {
+  document.querySelectorAll("[data-tab]").forEach((b) => b.setAttribute("aria-current", b.dataset.tab === name ? "true" : "false"));
+  document.querySelectorAll("[data-panel]").forEach((p) => p.classList.toggle("hidden", p.dataset.panel !== name));
+}
+async function boot() {
+  const me = await api("/v1/me");
+  if (!me.ok || me.data.user?.role !== "admin") return;
+  $("login").classList.add("hidden"); $("app").classList.remove("hidden");
+  $("who").textContent = me.data.user.email;
+  await loadOverview(); await loadUsers(); await loadCodes();
+}
+async function loadOverview() {
+  const r = await api("/v1/admin/overview"); if (!r.ok) return;
+  const c = r.data.config;
+  $("betaOpen").value = String(c.beta_open);
+  $("registrationOpen").value = String(c.registration_open);
+  $("maintenance").value = String(c.maintenance);
+  $("maintenanceMsg").value = c.maintenance_msg || "";
+  $("minVersion").value = c.min_version || "";
+  $("latestVersion").value = c.latest_version || "";
+  $("apkUrl").value = c.apk_url || "";
+  $("stats").textContent = `Usuarios: ${r.data.users} · códigos libres: ${r.data.codes.unused} · canjeados: ${r.data.codes.used}`;
+}
+async function loadUsers() {
+  const q = $("userQ").value.trim();
+  const r = await api("/v1/admin/users" + (q ? `?q=${encodeURIComponent(q)}` : "")); if (!r.ok) return;
+  $("userTable").innerHTML = "<tr><th>Email</th><th>Nombre</th><th>Rol</th><th>Estado</th><th></th></tr>" +
+    r.data.users.map((u) => `<tr><td>${u.email}</td><td>${u.name}</td><td>${u.role}</td><td><span class="pill ${u.banned?"off":"on"}">${u.banned?"ban":"ok"}</span></td><td>${u.banned?`<button data-unban="${u.id}">Quitar ban</button>`:`<button class="danger" data-ban="${u.id}">Ban</button>`}</td></tr>`).join("");
+}
+async function loadCodes() {
+  const r = await api("/v1/admin/codes"); if (!r.ok) return;
+  $("codeTable").innerHTML = "<tr><th>Código</th><th>Bundle</th><th>Estado</th><th>Quién</th><th></th></tr>" +
+    r.data.codes.map((c) => `<tr><td class="codes">${c.code}</td><td>${c.bundle_name}</td><td>${c.revoked?"revocado":c.uses>=c.max_uses?"usado":"libre"}</td><td>${c.redeemed_email||"—"}</td><td>${c.revoked||c.uses>=c.max_uses?"":`<button class="ghost" data-rev="${c.code}">Revocar</button>`}</td></tr>`).join("");
+}
+$("btnLogin").onclick = async () => {
+  const r = await api("/v1/auth/login", { method:"POST", body: JSON.stringify({ email:$("email").value, password:$("password").value }) });
+  if (!r.ok) { $("loginErr").textContent = r.data.error || "No se pudo entrar"; return; }
+  boot();
+};
+$("btnOut").onclick = async () => { await api("/v1/auth/logout", { method:"POST", body:"{}" }); location.reload(); };
+$("btnSave").onclick = async () => {
+  const r = await api("/v1/admin/config", { method:"POST", body: JSON.stringify({
+    betaOpen: $("betaOpen").value==="true", registrationOpen: $("registrationOpen").value==="true",
+    maintenance: $("maintenance").value==="true", maintenanceMsg: $("maintenanceMsg").value,
+    minVersion: $("minVersion").value, latestVersion: $("latestVersion").value, apkUrl: $("apkUrl").value,
+  })});
+  $("saveMsg").textContent = r.ok ? "Guardado." : (r.data.error || "Error");
+};
+$("btnSearch").onclick = loadUsers;
+$("btnGen").onclick = async () => {
+  const r = await api("/v1/admin/codes", { method:"POST", body: JSON.stringify({ count: Number($("codeCount").value||1), bundleId:"beta-tester-t1" }) });
+  $("newCodes").textContent = r.ok ? r.data.codes.join("\n") : r.data.error || "Error";
+  loadCodes();
+};
+document.querySelectorAll("[data-tab]").forEach((b) => b.onclick = () => tab(b.dataset.tab));
+document.body.addEventListener("click", async (e) => {
+  if (e.target.dataset.ban) { const reason = prompt("Motivo del ban","beta") || "ban"; await api(`/v1/admin/users/${e.target.dataset.ban}/ban`, { method:"POST", body: JSON.stringify({ reason }) }); loadUsers(); }
+  if (e.target.dataset.unban) { await api(`/v1/admin/users/${e.target.dataset.unban}/unban`, { method:"POST", body:"{}" }); loadUsers(); }
+  if (e.target.dataset.rev) { await api("/v1/admin/codes/revoke", { method:"POST", body: JSON.stringify({ code: e.target.dataset.rev }) }); loadCodes(); }
+});
+boot();
+</script>
+</body>
+</html>
