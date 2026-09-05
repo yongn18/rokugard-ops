@@ -1,0 +1,12 @@
+{
+  "name": "rokugard-ops",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
