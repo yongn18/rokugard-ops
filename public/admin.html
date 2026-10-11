@@ -49,6 +49,7 @@
         <button data-tab="estado" aria-current="true">Estado</button>
         <button data-tab="usuarios">Usuarios</button>
         <button data-tab="codigos">Códigos</button>
+        <button data-tab="regalos">Regalos</button>
         <button class="ghost" id="btnOut">Salir</button>
       </div>
       <section data-panel="estado" class="card">
@@ -76,6 +77,19 @@
         <p class="codes" id="newCodes"></p>
         <div style="overflow:auto"><table id="codeTable"></table></div>
       </section>
+      <section data-panel="regalos" class="card hidden">
+        <h2>Soltar un regalo</h2>
+        <p>Llega al buzón de esa cuenta. Se cobra una vez. Al registrarse: 200 gemas y 5 sobres. El día 1 del calendario son 20 gemas. Si falta un día, no se pierde lo cobrado.</p>
+        <div class="grid">
+          <label>Email<input id="giftEmail" type="email" /></label>
+          <label>Título<input id="giftTitle" value="Regalo" /></label>
+          <label>Gemas<input id="giftGems" type="number" min="0" max="5000" value="0" /></label>
+          <label>Sobres del Base<input id="giftPacks" type="number" min="0" max="20" value="0" /></label>
+          <label>Id de carta<input id="giftCard" placeholder="opcional" /></label>
+        </div>
+        <p><button id="btnGift">Enviar al buzón</button> <span id="giftMsg"></span></p>
+        <div style="overflow:auto"><table id="mailTable"></table></div>
+      </section>
     </section>
   </main>
 <script>
@@ -91,7 +105,7 @@ async function boot() {
   if (!me.ok || me.data.user?.role !== "admin") return;
   $("login").classList.add("hidden"); $("app").classList.remove("hidden");
   $("who").textContent = me.data.user.email;
-  await loadOverview(); await loadUsers(); await loadCodes();
+  await loadOverview(); await loadUsers(); await loadCodes(); await loadMail();
 }
 async function loadOverview() {
   const r = await api("/v1/admin/overview"); if (!r.ok) return;
@@ -109,7 +123,7 @@ async function loadUsers() {
   const q = $("userQ").value.trim();
   const r = await api("/v1/admin/users" + (q ? `?q=${encodeURIComponent(q)}` : "")); if (!r.ok) return;
   $("userTable").innerHTML = "<tr><th>Email</th><th>Nombre</th><th>Rol</th><th>Estado</th><th></th></tr>" +
-    r.data.users.map((u) => `<tr><td>${u.email}</td><td>${u.name}</td><td>${u.role}</td><td><span class="pill ${u.banned?"off":"on"}">${u.banned?"ban":"ok"}</span></td><td>${u.banned?`<button data-unban="${u.id}">Quitar ban</button>`:`<button class="danger" data-ban="${u.id}">Ban</button>`}</td></tr>`).join("");
+    r.data.users.map((u) => `<tr><td>${u.email}</td><td>${u.name}</td><td>${u.role}</td><td><span class="pill ${u.banned?"off":"on"}">${u.banned?"ban":"ok"}</span></td><td>${u.role==="admin"?"":u.banned?`<button data-unban="${u.id}">Quitar ban</button>`:`<button class="danger" data-ban="${u.id}">Ban</button>`} ${u.role==="admin"?"":`<button class="ghost" data-del="${u.id}">Borrar</button>`}</td></tr>`).join("");
 }
 async function loadCodes() {
   const r = await api("/v1/admin/codes"); if (!r.ok) return;
@@ -136,11 +150,29 @@ $("btnGen").onclick = async () => {
   $("newCodes").textContent = r.ok ? r.data.codes.join("\n") : r.data.error || "Error";
   loadCodes();
 };
-document.querySelectorAll("[data-tab]").forEach((b) => b.onclick = () => tab(b.dataset.tab));
+async function loadMail() {
+  const r = await api("/v1/admin/mail"); if (!r.ok) return;
+  $("mailTable").innerHTML = "<tr><th>Cuenta</th><th>Título</th><th>Qué</th><th>Estado</th></tr>" +
+    r.data.mail.map((m) => `<tr><td>${m.email}</td><td>${m.title}</td><td class="codes">${JSON.stringify(m.payload)}</td><td>${m.claimed_at?"cobrado":"en buzón"}</td></tr>`).join("");
+}
+$("btnGift").onclick = async () => {
+  const r = await api("/v1/admin/mail", { method:"POST", body: JSON.stringify({
+    email: $("giftEmail").value, title: $("giftTitle").value,
+    gems: Number($("giftGems").value||0), packs: Number($("giftPacks").value||0), cardId: $("giftCard").value,
+  })});
+  $("giftMsg").textContent = r.ok ? "En el buzón." : (r.data.error || "Error");
+  loadMail();
+};
+document.querySelectorAll("[data-tab]").forEach((b) => b.onclick = () => { tab(b.dataset.tab); if (b.dataset.tab==="regalos") loadMail(); });
 document.body.addEventListener("click", async (e) => {
   if (e.target.dataset.ban) { const reason = prompt("Motivo del ban","beta") || "ban"; await api(`/v1/admin/users/${e.target.dataset.ban}/ban`, { method:"POST", body: JSON.stringify({ reason }) }); loadUsers(); }
   if (e.target.dataset.unban) { await api(`/v1/admin/users/${e.target.dataset.unban}/unban`, { method:"POST", body:"{}" }); loadUsers(); }
   if (e.target.dataset.rev) { await api("/v1/admin/codes/revoke", { method:"POST", body: JSON.stringify({ code: e.target.dataset.rev }) }); loadCodes(); }
+  if (e.target.dataset.del) {
+    if (!confirm("Se borra la cuenta y su buzón. Podrá registrarse otra vez.")) return;
+    await api(`/v1/admin/users/${e.target.dataset.del}/delete`, { method:"POST", body:"{}" });
+    loadUsers();
+  }
 });
 boot();
 </script>

@@ -76,20 +76,25 @@ CREATE TABLE IF NOT EXISTS entitlements (
   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS admin_audit (
-  id BIGSERIAL PRIMARY KEY,
-  actor_id TEXT NOT NULL,
-  action TEXT NOT NULL,
-  target_id TEXT,
-  payload JSONB,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS mail (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  day DATE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at TIMESTAMPTZ
 );
+CREATE UNIQUE INDEX IF NOT EXISTS mail_daily_once ON mail (user_id, day) WHERE kind = 'daily' AND day IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS mail_welcome_once ON mail (user_id) WHERE kind = 'welcome';
 `;
 
 function json(res, status, body, extraHeaders = {}) {
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
+    ...corsHeaders(res.req || {}),
     ...extraHeaders,
   });
   res.end(JSON.stringify(body));
@@ -148,6 +153,80 @@ function randomCode() {
   return `RK-${chunk()}-${chunk()}`;
 }
 
+function limaDay(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/Lima", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+const DAILY_DAYS = 30;
+function dailyPayload(index) {
+  const day = index + 1;
+  if (day === 30) return { gems: 40, packs: 1 };
+  if (day % 7 === 0) return { packs: 1 };
+  if (day === 1) return { gems: 20 };
+  return { gems: 15 };
+}
+
+function cleanGrant(body) {
+  const gems = Math.max(0, Math.min(5000, Math.floor(Number(body.gems) || 0)));
+  const packs = Math.max(0, Math.min(20, Math.floor(Number(body.packs) || 0)));
+  const card = String(body.cardId || body.card || "").trim();
+  const gold = Math.max(0, Math.min(5000, Math.floor(Number(body.gold) || 0)));
+  const out = {};
+  if (gems) out.gems = gems;
+  if (packs) out.packs = packs;
+  if (gold) out.gold = gold;
+  if (card) out.card = card;
+  return out;
+}
+
+function publicMail(row) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    title: row.title,
+    payload: row.payload,
+    day: row.day,
+    createdAt: row.created_at,
+  };
+}
+
+async function grantWelcome(userId) {
+  await pool.query(
+    `INSERT INTO mail (id, user_id, kind, title, payload)
+     VALUES ($1,$2,'welcome','Bienvenida',$3)
+     ON CONFLICT DO NOTHING`,
+    [newId("mail"), userId, JSON.stringify({ gems: 200, packs: 5 })],
+  );
+}
+
+async function ensureDaily(userId) {
+  const day = limaDay();
+  const have = await pool.query("SELECT count(*)::int AS n FROM mail WHERE user_id = $1 AND kind = 'daily'", [userId]);
+  const n = have.rows[0].n;
+  if (n >= DAILY_DAYS) return;
+  const today = await pool.query("SELECT id FROM mail WHERE user_id = $1 AND kind = 'daily' AND day = $2", [userId, day]);
+  if (today.rows.length) return;
+  const payload = dailyPayload(n);
+  await pool.query(
+    `INSERT INTO mail (id, user_id, kind, title, payload, day)
+     VALUES ($1,$2,'daily',$3,$4,$5)
+     ON CONFLICT DO NOTHING`,
+    [newId("mail"), userId, `Día ${n + 1}`, JSON.stringify(payload), day],
+  );
+}
+
+function corsHeaders(req) {
+  const origin = String(req.headers.origin || "");
+  const ok = origin.startsWith("capacitor://") || origin.startsWith("http://localhost") || origin.startsWith("https://localhost") || origin.startsWith("http://127.0.0.1");
+  if (!ok) return {};
+  return {
+    "access-control-allow-origin": origin,
+    vary: "Origin",
+    "access-control-allow-headers": "content-type, authorization, x-rokugard-version",
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+  };
+}
+
 function clientVersion(req) {
   return req.headers["x-rokugard-version"] || req.headers["x-client-version"] || null;
 }
@@ -161,7 +240,9 @@ function publicUser(row) {
 }
 
 async function getSessionUser(req) {
-  const sid = parseCookies(req).rk_session;
+  const header = String(req.headers.authorization || "");
+  const bearer = /^Bearer\s+(.+)$/i.exec(header)?.[1] || "";
+  const sid = bearer || parseCookies(req).rk_session;
   if (!sid) return { session: null, user: null };
   const { rows } = await pool.query(
     `SELECT s.id AS session_id, s.expires_at, u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1`,
@@ -248,8 +329,9 @@ async function handleApi(req, res, url) {
         `INSERT INTO users (id, email, name, password_hash, client_version) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
         [newId("usr"), email, name, hashPassword(password), clientVersion(req)],
       );
+      await grantWelcome(rows[0].id);
       const sid = await createSession(rows[0].id);
-      return json(res, 201, { user: publicUser(rows[0]) }, { "set-cookie": cookieHeader("rk_session", sid, { maxAge: 14 * 86400 }) });
+      return json(res, 201, { user: publicUser(rows[0]), token: sid }, { "set-cookie": cookieHeader("rk_session", sid, { maxAge: 14 * 86400 }) });
     } catch (err) {
       if (String(err.message).includes("users_email_key")) return json(res, 409, { error: "Ese email ya está registrado." });
       throw err;
@@ -265,7 +347,7 @@ async function handleApi(req, res, url) {
     if (user.banned) return json(res, 403, { error: "Cuenta suspendida.", reason: user.ban_reason });
     const sid = await createSession(user.id);
     await pool.query("UPDATE users SET last_seen_at = now() WHERE id = $1", [user.id]);
-    return json(res, 200, { user: publicUser(user) }, { "set-cookie": cookieHeader("rk_session", sid, { maxAge: 14 * 86400 }) });
+    return json(res, 200, { user: publicUser(user), token: sid }, { "set-cookie": cookieHeader("rk_session", sid, { maxAge: 14 * 86400 }) });
   }
   if (method === "POST" && p === "/v1/auth/logout") {
     const sid = parseCookies(req).rk_session;
@@ -277,6 +359,31 @@ async function handleApi(req, res, url) {
     if (!user) return json(res, 401, { error: "No hay sesión." });
     if (user.banned) return json(res, 403, { error: "Cuenta suspendida.", reason: user.ban_reason });
     return json(res, 200, { user: publicUser(user) });
+  }
+  if (method === "POST" && p === "/v1/mailbox/sync") {
+    const { user } = await getSessionUser(req);
+    if (!user) return json(res, 401, { error: "No hay sesión." });
+    if (user.banned) return json(res, 403, { error: "Cuenta suspendida.", reason: user.ban_reason });
+    await ensureDaily(user.id);
+    const { rows } = await pool.query(
+      `SELECT id, kind, title, payload, day, created_at FROM mail WHERE user_id = $1 AND claimed_at IS NULL ORDER BY created_at ASC`,
+      [user.id],
+    );
+    const count = await pool.query("SELECT count(*)::int AS n FROM mail WHERE user_id = $1 AND kind = 'daily'", [user.id]);
+    return json(res, 200, { mail: rows.map(publicMail), dailyDone: count.rows[0].n, dailyMax: DAILY_DAYS });
+  }
+  if (method === "POST" && p === "/v1/mailbox/claim") {
+    const { user } = await getSessionUser(req);
+    if (!user) return json(res, 401, { error: "No hay sesión." });
+    if (user.banned) return json(res, 403, { error: "Cuenta suspendida." });
+    const body = await readBody(req);
+    const id = String(body.id || "");
+    const { rows } = await pool.query(
+      `UPDATE mail SET claimed_at = now() WHERE id = $1 AND user_id = $2 AND claimed_at IS NULL RETURNING id, kind, title, payload`,
+      [id, user.id],
+    );
+    if (!rows.length) return json(res, 409, { error: "Ese regalo ya se cobró." });
+    return json(res, 200, { ok: true, mail: publicMail(rows[0]) });
   }
   if (method === "POST" && p === "/v1/redeem") {
     const { user } = await getSessionUser(req);
@@ -298,6 +405,10 @@ async function handleApi(req, res, url) {
       if (row.uses >= row.max_uses) { await client.query("ROLLBACK"); return json(res, 409, { error: "Este código ya fue canjeado." }); }
       await client.query(`UPDATE redeem_codes SET uses = uses + 1, redeemed_by = $2, redeemed_at = now() WHERE id = $1`, [row.id, user.id]);
       await client.query(`INSERT INTO entitlements (id, user_id, kind, payload) VALUES ($1,$2,'bundle',$3)`, [newId("ent"), user.id, JSON.stringify({ bundleId: row.bundle_id, grants: row.grants, code })]);
+      await client.query(
+        `INSERT INTO mail (id, user_id, kind, title, payload) VALUES ($1,$2,'code',$3,$4)`,
+        [newId("mail"), user.id, row.bundle_name, JSON.stringify(row.grants)],
+      );
       await client.query("COMMIT");
       return json(res, 200, { ok: true, bundle: row.bundle_name, grants: row.grants });
     } catch (err) {
@@ -355,6 +466,40 @@ async function handleApi(req, res, url) {
       await audit(user.id, "user.unban", id, {});
       return json(res, 200, { ok: true });
     }
+    if (method === "POST" && p.startsWith("/v1/admin/users/") && p.endsWith("/delete")) {
+      const id = p.split("/")[4];
+      if (id === user.id) return json(res, 400, { error: "No puedes borrar tu propia cuenta." });
+      const found = await pool.query("SELECT id, role, email FROM users WHERE id = $1", [id]);
+      if (!found.rows.length) return json(res, 404, { error: "No está." });
+      if (found.rows[0].role === "admin") return json(res, 400, { error: "No se borra un admin." });
+      await pool.query("DELETE FROM users WHERE id = $1", [id]);
+      await audit(user.id, "user.delete", id, { email: found.rows[0].email });
+      return json(res, 200, { ok: true });
+    }
+    if (method === "POST" && p === "/v1/admin/mail") {
+      const body = await readBody(req);
+      const email = String(body.email || "").trim().toLowerCase();
+      const found = await pool.query("SELECT id, email FROM users WHERE email = $1", [email]);
+      if (!found.rows.length) return json(res, 404, { error: "Ese email no está registrado." });
+      const payload = cleanGrant(body);
+      if (!Object.keys(payload).length) return json(res, 400, { error: "El regalo está vacío." });
+      const title = String(body.title || "Regalo").trim().slice(0, 80) || "Regalo";
+      const id = newId("mail");
+      await pool.query(
+        `INSERT INTO mail (id, user_id, kind, title, payload) VALUES ($1,$2,'gift',$3,$4)`,
+        [id, found.rows[0].id, title, JSON.stringify(payload)],
+      );
+      await audit(user.id, "mail.grant", found.rows[0].id, { title, payload });
+      return json(res, 201, { ok: true, id });
+    }
+    if (method === "GET" && p === "/v1/admin/mail") {
+      const { rows } = await pool.query(
+        `SELECT m.id, m.kind, m.title, m.payload, m.day, m.created_at, m.claimed_at, u.email
+         FROM mail m JOIN users u ON u.id = m.user_id
+         ORDER BY m.created_at DESC LIMIT 80`,
+      );
+      return json(res, 200, { mail: rows });
+    }
     if (method === "POST" && p === "/v1/admin/codes") {
       const body = await readBody(req);
       const bundleId = body.bundleId || "beta-tester-t1";
@@ -401,6 +546,13 @@ function serveAdmin(req, res, url) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    res.req = req;
+    if (req.method === "OPTIONS") {
+      const headers = corsHeaders(req);
+      res.writeHead(204, headers);
+      res.end();
+      return;
+    }
     const host = req.headers.host || "localhost";
     const url = new URL(req.url || "/", `https://${host}`);
     if (url.pathname.startsWith("/v1/") || url.pathname === "/health") return await handleApi(req, res, url);
