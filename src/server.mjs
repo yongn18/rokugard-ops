@@ -14,6 +14,46 @@ const ADMIN_BOOTSTRAP_PASSWORD = process.env.ADMIN_BOOTSTRAP_PASSWORD || "";
 const ADMIN_NAME = process.env.ADMIN_NAME || "Roku";
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "158145639528-h5o0qd8v12ddlkht2t325ijdvv2v5sir.apps.googleusercontent.com";
 const GOOGLE_REDIRECT = "com.googleusercontent.apps.158145639528-h5o0qd8v12ddlkht2t325ijdvv2v5sir:/oauth2redirect";
+const CONTENT_DIR = process.env.CONTENT_DIR || "/home/deploy/rokugard/content";
+let contentCache = null;
+
+function loadContent() {
+  const pack = path.join(CONTENT_DIR, "pack.bin");
+  const metaPath = path.join(CONTENT_DIR, "meta.json");
+  if (!fs.existsSync(pack) || !fs.existsSync(metaPath)) return null;
+  const stat = fs.statSync(pack);
+  if (contentCache && contentCache.mtime === stat.mtimeMs && contentCache.size === stat.size) return contentCache;
+  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
+  if (!meta.key || !meta.sha256 || meta.bytes !== stat.size) return null;
+  contentCache = { pack, key: meta.key, sha256: meta.sha256, bytes: stat.size, mtime: stat.mtimeMs, size: stat.size };
+  return contentCache;
+}
+
+function servePack(req, res, file, size) {
+  const headers = {
+    "content-type": "application/octet-stream",
+    "accept-ranges": "bytes",
+    "cache-control": "no-store",
+    "access-control-expose-headers": "content-length, content-range, accept-ranges",
+    ...corsHeaders(req),
+  };
+  const range = String(req.headers.range || "");
+  const match = /^bytes=(\d+)-(\d*)$/.exec(range);
+  if (match) {
+    const start = Number(match[1]);
+    const end = match[2] ? Number(match[2]) : size - 1;
+    if (start >= size || end < start) {
+      res.writeHead(416, { "content-range": `bytes */${size}`, ...headers });
+      res.end();
+      return;
+    }
+    res.writeHead(206, { ...headers, "content-range": `bytes ${start}-${end}/${size}`, "content-length": end - start + 1 });
+    fs.createReadStream(file, { start, end }).pipe(res);
+    return;
+  }
+  res.writeHead(200, { ...headers, "content-length": size });
+  fs.createReadStream(file).pipe(res);
+}
 
 if (!DATABASE_URL) {
   console.error("Falta DATABASE_URL");
@@ -456,6 +496,15 @@ async function handleApi(req, res, url) {
       }
       throw err;
     }
+  }
+  if ((method === "GET") && (p === "/v1/content/manifest" || p === "/v1/content/pack")) {
+    const { user } = await getSessionUser(req);
+    if (!user) return json(res, 401, { error: "No hay sesión." });
+    if (user.banned) return json(res, 403, { error: "Cuenta suspendida." });
+    const content = loadContent();
+    if (!content) return json(res, 503, { error: "El paquete no está en el servidor." });
+    if (p === "/v1/content/manifest") return json(res, 200, { v: 1, bytes: content.bytes, sha256: content.sha256, key: content.key });
+    return servePack(req, res, content.pack, content.bytes);
   }
   if (method === "GET" && p === "/v1/me") {
     const { user } = await getSessionUser(req);
