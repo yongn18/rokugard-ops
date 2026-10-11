@@ -12,6 +12,8 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "roku@waruchan.com").toLowerCase();
 const ADMIN_BOOTSTRAP_PASSWORD = process.env.ADMIN_BOOTSTRAP_PASSWORD || "";
 const ADMIN_NAME = process.env.ADMIN_NAME || "Roku";
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "158145639528-h5o0qd8v12ddlkht2t325ijdvv2v5sir.apps.googleusercontent.com";
+const GOOGLE_REDIRECT = "com.googleusercontent.apps.158145639528-h5o0qd8v12ddlkht2t325ijdvv2v5sir:/oauth2redirect";
 
 if (!DATABASE_URL) {
   console.error("Falta DATABASE_URL");
@@ -88,6 +90,13 @@ CREATE TABLE IF NOT EXISTS mail (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS mail_daily_once ON mail (user_id, day) WHERE kind = 'daily' AND day IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS mail_welcome_once ON mail (user_id) WHERE kind = 'welcome';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS users_google_sub ON users (google_sub) WHERE google_sub IS NOT NULL;
+CREATE TABLE IF NOT EXISTS oauth_pending (
+  id TEXT PRIMARY KEY,
+  code_verifier TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 function json(res, status, body, extraHeaders = {}) {
@@ -298,6 +307,82 @@ function isAdminHost(req) {
   return String(req.headers.host || "").split(":")[0].startsWith("admin-rkg");
 }
 
+function b64url(buf) {
+  return Buffer.from(buf).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function googleStart() {
+  const verifier = b64url(crypto.randomBytes(32));
+  const challenge = b64url(crypto.createHash("sha256").update(verifier).digest());
+  const state = newId("gst");
+  await pool.query("DELETE FROM oauth_pending WHERE created_at < now() - interval '15 minutes'");
+  await pool.query("INSERT INTO oauth_pending (id, code_verifier) VALUES ($1,$2)", [state, verifier]);
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", GOOGLE_CLIENT_ID);
+  url.searchParams.set("redirect_uri", GOOGLE_REDIRECT);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", "openid email profile");
+  url.searchParams.set("state", state);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("prompt", "select_account");
+  return { url: url.toString(), state };
+}
+
+async function googleIdentity(code, state) {
+  const found = await pool.query("SELECT code_verifier, created_at FROM oauth_pending WHERE id = $1", [state]);
+  const row = found.rows[0];
+  if (!row) return { error: "El ingreso con Google venció. Inténtalo otra vez.", status: 410 };
+  await pool.query("DELETE FROM oauth_pending WHERE id = $1", [state]);
+  const body = new URLSearchParams({
+    code: String(code || ""),
+    client_id: GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_REDIRECT,
+    grant_type: "authorization_code",
+    code_verifier: row.code_verifier,
+  });
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const token = await tokenRes.json().catch(() => ({}));
+  if (!tokenRes.ok || !token.id_token) return { error: "Google no confirmó la cuenta.", status: 401 };
+  const infoRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(token.id_token)}`);
+  const info = await infoRes.json().catch(() => ({}));
+  if (!infoRes.ok || info.aud !== GOOGLE_CLIENT_ID) return { error: "Google no confirmó la cuenta.", status: 401 };
+  if (String(info.email_verified) !== "true") return { error: "Ese correo de Google no está verificado.", status: 403 };
+  const email = String(info.email || "").trim().toLowerCase();
+  const sub = String(info.sub || "");
+  if (!email.includes("@") || !sub) return { error: "Google no entregó el correo.", status: 401 };
+  return { email, sub, name: String(info.name || email.split("@")[0]).slice(0, 80) };
+}
+
+async function loginGoogleIdentity(identity, version) {
+  let user = (await pool.query("SELECT * FROM users WHERE google_sub = $1", [identity.sub])).rows[0];
+  if (!user) user = (await pool.query("SELECT * FROM users WHERE email = $1", [identity.email])).rows[0];
+  let created = false;
+  if (!user) {
+    const cfg = (await pool.query("SELECT registration_open, beta_open FROM game_config WHERE id = 1")).rows[0];
+    if (!cfg.registration_open && !cfg.beta_open) return { error: "El registro está cerrado.", status: 403 };
+    const inserted = await pool.query(
+      `INSERT INTO users (id, email, name, password_hash, google_sub, client_version) VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [newId("usr"), identity.email, identity.name, "google:no-password", identity.sub, version],
+    );
+    user = inserted.rows[0];
+    created = true;
+    await grantWelcome(user.id);
+  } else if (!user.google_sub) {
+    await pool.query("UPDATE users SET google_sub = $2 WHERE id = $1 AND google_sub IS NULL", [user.id, identity.sub]);
+  } else if (user.google_sub !== identity.sub) {
+    return { error: "Ese correo ya está ligado a otra cuenta de Google.", status: 409 };
+  }
+  if (user.banned) return { error: "Cuenta suspendida.", status: 403, reason: user.ban_reason };
+  const sid = await createSession(user.id);
+  await pool.query("UPDATE users SET last_seen_at = now(), client_version = COALESCE($2, client_version) WHERE id = $1", [user.id, version]);
+  return { user: publicUser(user), token: sid, created };
+}
+
 async function handleApi(req, res, url) {
   const method = req.method || "GET";
   const p = url.pathname;
@@ -353,6 +438,24 @@ async function handleApi(req, res, url) {
     const sid = parseCookies(req).rk_session;
     if (sid) await pool.query("DELETE FROM sessions WHERE id = $1", [sid]);
     return json(res, 200, { ok: true }, { "set-cookie": cookieHeader("rk_session", "", { maxAge: 0 }) });
+  }
+  if (method === "POST" && p === "/v1/auth/google/start") {
+    return json(res, 200, await googleStart());
+  }
+  if (method === "POST" && p === "/v1/auth/google") {
+    const body = await readBody(req);
+    const identity = await googleIdentity(body.code, String(body.state || ""));
+    if (identity.error) return json(res, identity.status || 401, { error: identity.error });
+    try {
+      const session = await loginGoogleIdentity(identity, clientVersion(req));
+      if (session.error) return json(res, session.status || 403, { error: session.error, reason: session.reason });
+      return json(res, 200, { user: session.user, token: session.token, created: session.created }, { "set-cookie": cookieHeader("rk_session", session.token, { maxAge: 14 * 86400 }) });
+    } catch (err) {
+      if (String(err.message).includes("users_email_key") || String(err.message).includes("users_google_sub")) {
+        return json(res, 409, { error: "Ese correo ya está registrado." });
+      }
+      throw err;
+    }
   }
   if (method === "GET" && p === "/v1/me") {
     const { user } = await getSessionUser(req);
