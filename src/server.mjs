@@ -168,6 +168,8 @@ ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_deck JSONB;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS a_name TEXT;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_name TEXT;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS seq INT NOT NULL DEFAULT 0;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS a_loaded BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_loaded BOOLEAN NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS match_acts (
   match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
   seq INT NOT NULL,
@@ -577,6 +579,8 @@ function tableView(user, row, actions = []) {
       foeDeck: deck(youA ? row.b_deck : row.a_deck),
       youReady: Boolean(youA ? row.a_deck : row.b_deck),
       foeReady: Boolean(youA ? row.b_deck : row.a_deck),
+      youLoaded: Boolean(youA ? row.a_loaded : row.b_loaded),
+      foeLoaded: Boolean(youA ? row.b_loaded : row.a_loaded),
       seq: row.seq || 0,
       actions,
     },
@@ -675,10 +679,20 @@ async function handleSocial(req, res, p) {
       const seed = crypto.randomInt(1, 2147483646);
       const first = crypto.randomInt(2) === 0 ? "a" : "b";
       await pool.query(
-        `UPDATE matches SET status = 'live', seed = $2, first_seat = $3 WHERE id = $1 AND status = 'found'`,
+        `UPDATE matches SET status = 'live', seed = $2, first_seat = $3, a_loaded = false, b_loaded = false WHERE id = $1 AND status = 'found'`,
         [fresh.id, seed, first],
       );
     }
+    return json(res, 200, tableView(user, await currentMatch(user)));
+  }
+  if (p === "/v1/social/loaded") {
+    const row = await currentMatch(user);
+    if (!row || row.status !== "live") return json(res, 409, { error: "La mesa todavía no está." });
+    const youA = row.a_id === user.id;
+    await pool.query(
+      `UPDATE matches SET ${youA ? "a_loaded" : "b_loaded"} = true WHERE id = $1`,
+      [row.id],
+    );
     return json(res, 200, tableView(user, await currentMatch(user)));
   }
   if (p === "/v1/social/act") {
