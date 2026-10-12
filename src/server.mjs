@@ -137,6 +137,30 @@ CREATE TABLE IF NOT EXISTS oauth_pending (
   code_verifier TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tag TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS users_tag ON users (tag) WHERE tag IS NOT NULL;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS queue_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS friends (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  other_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, other_id)
+);
+CREATE TABLE IF NOT EXISTS invites (
+  id TEXT PRIMARY KEY,
+  from_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  to_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS matches (
+  id TEXT PRIMARY KEY,
+  a_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  b_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'found',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 `;
 
 function json(res, status, body, extraHeaders = {}) {
@@ -283,7 +307,7 @@ function clientVersion(req) {
 function publicUser(row) {
   if (!row) return null;
   return {
-    id: row.id, email: row.email, name: row.name, role: row.role, banned: row.banned,
+    id: row.id, email: row.email, name: row.name, tag: row.tag || "", role: row.role, banned: row.banned,
     banReason: row.ban_reason, clientVersion: row.client_version, lastSeenAt: row.last_seen_at, createdAt: row.created_at,
   };
 }
@@ -423,6 +447,137 @@ async function loginGoogleIdentity(identity, version) {
   return { user: publicUser(user), token: sid, created };
 }
 
+const TAG_ALPH = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+function makeTag() {
+  let s = "RG-";
+  for (let i = 0; i < 4; i += 1) s += TAG_ALPH[crypto.randomInt(TAG_ALPH.length)];
+  return s;
+}
+
+async function ensureTag(user) {
+  if (user.tag) return user.tag;
+  for (let i = 0; i < 8; i += 1) {
+    const tag = makeTag();
+    await pool.query("UPDATE users SET tag = $2 WHERE id = $1 AND tag IS NULL", [user.id, tag]).catch(() => {});
+    const { rows } = await pool.query("SELECT tag FROM users WHERE id = $1", [user.id]);
+    if (rows[0]?.tag) {
+      user.tag = rows[0].tag;
+      return rows[0].tag;
+    }
+  }
+  return "";
+}
+
+function onlineOf(row) {
+  const seen = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
+  return Date.now() - seen < 20000;
+}
+
+async function socialState(user) {
+  await ensureTag(user);
+  await pool.query("UPDATE users SET last_seen_at = now() WHERE id = $1", [user.id]);
+  const friends = await pool.query(
+    `SELECT u.id, u.name, u.tag, u.last_seen_at FROM friends f JOIN users u ON u.id = f.other_id WHERE f.user_id = $1 ORDER BY u.name`,
+    [user.id],
+  );
+  const invites = await pool.query(
+    `SELECT i.id, i.kind, u.name, u.tag, u.last_seen_at FROM invites i JOIN users u ON u.id = i.from_id
+     WHERE i.to_id = $1 AND i.status = 'pending' AND i.created_at > now() - interval '10 minutes' ORDER BY i.created_at DESC`,
+    [user.id],
+  );
+  const match = await pool.query(
+    `SELECT m.id, m.status, u.name, u.tag FROM matches m
+     JOIN users u ON u.id = CASE WHEN m.a_id = $1 THEN m.b_id ELSE m.a_id END
+     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status = 'found' AND m.created_at > now() - interval '30 minutes'
+     ORDER BY m.created_at DESC LIMIT 1`,
+    [user.id],
+  );
+  const me = (await pool.query("SELECT tag, name FROM users WHERE id = $1", [user.id])).rows[0] || {};
+  return {
+    me: { tag: me.tag || "", name: me.name || "" },
+    friends: friends.rows.map((r) => ({ tag: r.tag, name: r.name, online: onlineOf(r) })),
+    invites: invites.rows.map((r) => ({ id: r.id, kind: r.kind, fromTag: r.tag, fromName: r.name, online: onlineOf(r) })),
+    match: match.rows[0] ? { id: match.rows[0].id, foeName: match.rows[0].name, foeTag: match.rows[0].tag, status: match.rows[0].status } : null,
+  };
+}
+
+async function findByTag(tag) {
+  const { rows } = await pool.query("SELECT id, name, tag, last_seen_at FROM users WHERE tag = $1", [String(tag || "").toUpperCase()]);
+  return rows[0] || null;
+}
+
+async function handleSocial(req, res, p) {
+  const { user } = await getSessionUser(req);
+  if (!user) return json(res, 401, { error: "No hay sesión." });
+  if (user.banned) return json(res, 403, { error: "Cuenta suspendida." });
+  const body = req.method === "POST" ? await readBody(req) : {};
+  if (p === "/v1/social/sync") return json(res, 200, await socialState(user));
+  if (p === "/v1/social/name") {
+    const name = String(body.name || "").trim().slice(0, 24);
+    if (name.length < 2) return json(res, 400, { error: "El nombre necesita al menos 2 letras." });
+    await pool.query("UPDATE users SET name = $2 WHERE id = $1", [user.id, name]);
+    return json(res, 200, await socialState(user));
+  }
+  if (p === "/v1/social/search") {
+    const q = String(body.q || "").trim();
+    if (q.length < 2) return json(res, 200, { hits: [] });
+    const { rows } = await pool.query(
+      `SELECT name, tag, last_seen_at FROM users WHERE id <> $1 AND (tag = $2 OR name ILIKE $3) ORDER BY name LIMIT 8`,
+      [user.id, q.toUpperCase(), `%${q.replace(/[%_]/g, "")}%`],
+    );
+    return json(res, 200, { hits: rows.map((r) => ({ name: r.name, tag: r.tag, online: onlineOf(r) })) });
+  }
+  if (p === "/v1/social/friend" || p === "/v1/social/duel") {
+    const other = await findByTag(body.tag);
+    if (!other || other.id === user.id) return json(res, 404, { error: "No hay un jugador con ese ID." });
+    const kind = p.endsWith("duel") ? "duel" : "friend";
+    if (kind === "duel" && !onlineOf(other)) return json(res, 409, { error: "Ese jugador no está en línea." });
+    if (kind === "friend") {
+      const already = await pool.query("SELECT 1 FROM friends WHERE user_id = $1 AND other_id = $2", [user.id, other.id]);
+      if (already.rows.length) return json(res, 409, { error: "Ya está en tu lista." });
+    }
+    const id = newId("inv");
+    await pool.query("INSERT INTO invites (id, from_id, to_id, kind) VALUES ($1,$2,$3,$4)", [id, user.id, other.id, kind]);
+    return json(res, 200, { ok: true, ...(await socialState(user)) });
+  }
+  if (p === "/v1/social/answer") {
+    const { rows } = await pool.query(
+      `UPDATE invites SET status = $3 WHERE id = $1 AND to_id = $2 AND status = 'pending' RETURNING id, from_id, kind`,
+      [String(body.id || ""), user.id, body.accept ? "accepted" : "declined"],
+    );
+    const inv = rows[0];
+    if (!inv) return json(res, 409, { error: "Esa invitación ya no está." });
+    if (body.accept && inv.kind === "friend") {
+      await pool.query(
+        `INSERT INTO friends (user_id, other_id) VALUES ($1,$2), ($2,$1) ON CONFLICT DO NOTHING`,
+        [user.id, inv.from_id],
+      );
+    }
+    if (body.accept && inv.kind === "duel") {
+      await pool.query("INSERT INTO matches (id, a_id, b_id) VALUES ($1,$2,$3)", [newId("match"), inv.from_id, user.id]);
+    }
+    return json(res, 200, await socialState(user));
+  }
+  if (p === "/v1/social/queue") {
+    if (!body.join) {
+      await pool.query("UPDATE users SET queue_at = NULL WHERE id = $1", [user.id]);
+      return json(res, 200, await socialState(user));
+    }
+    await pool.query("UPDATE users SET queue_at = now(), last_seen_at = now() WHERE id = $1", [user.id]);
+    const other = await pool.query(
+      `SELECT id FROM users WHERE queue_at IS NOT NULL AND id <> $1 AND last_seen_at > now() - interval '20 seconds' ORDER BY queue_at ASC LIMIT 1`,
+      [user.id],
+    );
+    if (other.rows[0]) {
+      await pool.query("UPDATE users SET queue_at = NULL WHERE id = $1 OR id = $2", [user.id, other.rows[0].id]);
+      await pool.query("INSERT INTO matches (id, a_id, b_id) VALUES ($1,$2,$3)", [newId("match"), user.id, other.rows[0].id]);
+    }
+    return json(res, 200, await socialState(user));
+  }
+  return json(res, 404, { error: "No existe." });
+}
+
 async function handleApi(req, res, url) {
   const method = req.method || "GET";
   const p = url.pathname;
@@ -506,6 +661,7 @@ async function handleApi(req, res, url) {
     if (p === "/v1/content/manifest") return json(res, 200, { v: 1, bytes: content.bytes, sha256: content.sha256, key: content.key });
     return servePack(req, res, content.pack, content.bytes);
   }
+  if (p.startsWith("/v1/social/")) return handleSocial(req, res, p);
   if (method === "GET" && p === "/v1/me") {
     const { user } = await getSessionUser(req);
     if (!user) return json(res, 401, { error: "No hay sesión." });
