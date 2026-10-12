@@ -552,7 +552,7 @@ async function currentMatch(user) {
      FROM matches m
      JOIN users ua ON ua.id = m.a_id
      JOIN users ub ON ub.id = m.b_id
-     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status IN ('found', 'live')
+     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status IN ('found', 'live', 'done')
        AND m.created_at > now() - interval '30 minutes'
      ORDER BY m.created_at DESC LIMIT 1`,
     [user.id],
@@ -695,6 +695,13 @@ async function handleSocial(req, res, p) {
     );
     return json(res, 200, tableView(user, await currentMatch(user)));
   }
+  if (p === "/v1/social/close") {
+    await pool.query(
+      `UPDATE matches SET status = 'done' WHERE status IN ('found', 'live') AND (a_id = $1 OR b_id = $1)`,
+      [user.id],
+    );
+    return json(res, 200, { ok: true });
+  }
   if (p === "/v1/social/act") {
     const row = await currentMatch(user);
     if (!row || row.status !== "live") return json(res, 409, { error: "La mesa todavía no está." });
@@ -728,7 +735,7 @@ async function handleSocial(req, res, p) {
       await pool.query("UPDATE users SET queue_at = NULL WHERE id = $1", [user.id]);
       if (body.close) {
         await pool.query(
-          `UPDATE matches SET status = 'closed' WHERE status = 'found' AND (a_id = $1 OR b_id = $1)`,
+          `UPDATE matches SET status = 'done' WHERE status IN ('found', 'live') AND (a_id = $1 OR b_id = $1)`,
           [user.id],
         );
       }
