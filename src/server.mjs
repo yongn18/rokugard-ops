@@ -170,6 +170,8 @@ ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_name TEXT;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS seq INT NOT NULL DEFAULT 0;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS a_loaded BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_loaded BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS tossed BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
 CREATE TABLE IF NOT EXISTS match_acts (
   match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
   seq INT NOT NULL,
@@ -548,7 +550,7 @@ async function findByTag(tag) {
 
 async function currentMatch(user) {
   const { rows } = await pool.query(
-    `SELECT m.*, ua.name AS name_a, ub.name AS name_b
+    `SELECT m.*, ua.name AS name_a, ub.name AS name_b, ua.avatar AS avatar_a, ub.avatar AS avatar_b
      FROM matches m
      JOIN users ua ON ua.id = m.a_id
      JOIN users ub ON ub.id = m.b_id
@@ -558,6 +560,13 @@ async function currentMatch(user) {
     [user.id],
   );
   return rows[0] || null;
+}
+
+function safeAvatar(value) {
+  const src = String(value || "");
+  if (src.includes("..")) return "";
+  if (src.startsWith("/avatars/") || src.startsWith("/story/portraits/")) return src;
+  return "";
 }
 
 function tableView(user, row, actions = []) {
@@ -581,6 +590,9 @@ function tableView(user, row, actions = []) {
       foeReady: Boolean(youA ? row.b_deck : row.a_deck),
       youLoaded: Boolean(youA ? row.a_loaded : row.b_loaded),
       foeLoaded: Boolean(youA ? row.b_loaded : row.a_loaded),
+      youToss: ((Number(row.seed) || 0) % 2 === 0) === youA,
+      tossed: Boolean(row.tossed),
+      foeAvatar: safeAvatar(youA ? row.avatar_b : row.avatar_a),
       seq: row.seq || 0,
       actions,
     },
@@ -679,7 +691,7 @@ async function handleSocial(req, res, p) {
       const seed = crypto.randomInt(1, 2147483646);
       const first = crypto.randomInt(2) === 0 ? "a" : "b";
       await pool.query(
-        `UPDATE matches SET status = 'live', seed = $2, first_seat = $3, a_loaded = false, b_loaded = false WHERE id = $1 AND status = 'found'`,
+        `UPDATE matches SET status = 'live', seed = $2, first_seat = $3, a_loaded = false, b_loaded = false, tossed = false WHERE id = $1 AND status = 'found'`,
         [fresh.id, seed, first],
       );
     }
@@ -694,6 +706,21 @@ async function handleSocial(req, res, p) {
       [row.id],
     );
     return json(res, 200, tableView(user, await currentMatch(user)));
+  }
+  if (p === "/v1/social/toss") {
+    const row = await currentMatch(user);
+    if (!row || row.status !== "live") return json(res, 409, { error: "La mesa todavía no está." });
+    const youA = row.a_id === user.id;
+    const youToss = ((Number(row.seed) || 0) % 2 === 0) === youA;
+    if (!youToss) return json(res, 403, { error: "La moneda la lanza el rival." });
+    await pool.query("UPDATE matches SET tossed = true WHERE id = $1", [row.id]);
+    return json(res, 200, tableView(user, await currentMatch(user)));
+  }
+  if (p === "/v1/social/avatar") {
+    const avatar = safeAvatar(body.avatar);
+    if (!avatar) return json(res, 400, { error: "Ese retrato no está disponible." });
+    await pool.query("UPDATE users SET avatar = $2 WHERE id = $1", [user.id, avatar]);
+    return json(res, 200, { ok: true, avatar });
   }
   if (p === "/v1/social/close") {
     await pool.query(
