@@ -161,6 +161,20 @@ CREATE TABLE IF NOT EXISTS matches (
   status TEXT NOT NULL DEFAULT 'found',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS seed INT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS first_seat TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS a_deck JSONB;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_deck JSONB;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS a_name TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS b_name TEXT;
+ALTER TABLE matches ADD COLUMN IF NOT EXISTS seq INT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS match_acts (
+  match_id TEXT NOT NULL REFERENCES matches(id) ON DELETE CASCADE,
+  seq INT NOT NULL,
+  seat TEXT NOT NULL,
+  payload JSONB NOT NULL,
+  PRIMARY KEY (match_id, seq)
+);
 `;
 
 function json(res, status, body, extraHeaders = {}) {
@@ -492,9 +506,12 @@ async function socialState(user) {
     [user.id],
   );
   const match = await pool.query(
-    `SELECT m.id, m.status, u.name, u.tag FROM matches m
+    `SELECT m.id, m.status, m.a_id, m.b_id, m.seed, m.first_seat, m.seq,
+            m.a_deck IS NOT NULL AS a_ready, m.b_deck IS NOT NULL AS b_ready,
+            u.name, u.tag
+     FROM matches m
      JOIN users u ON u.id = CASE WHEN m.a_id = $1 THEN m.b_id ELSE m.a_id END
-     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status = 'found' AND m.created_at > now() - interval '10 minutes'
+     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status IN ('found', 'live') AND m.created_at > now() - interval '30 minutes'
      ORDER BY m.created_at DESC LIMIT 1`,
     [user.id],
   );
@@ -502,6 +519,8 @@ async function socialState(user) {
   const searching = await pool.query(
     `SELECT count(*)::int AS n FROM users WHERE queue_at IS NOT NULL AND last_seen_at > now() - interval '45 seconds'`,
   );
+  const row = match.rows[0];
+  const youA = row ? row.a_id === user.id : false;
   return {
     me: { tag: me.tag || "", name: me.name || "" },
     queued: Boolean(me.queue_at),
@@ -509,13 +528,59 @@ async function socialState(user) {
     friends: friends.rows.map((r) => ({ tag: r.tag, name: r.name, online: onlineOf(r) })),
     invites: invites.rows.map((r) => ({ id: r.id, kind: r.kind, fromTag: r.tag, fromName: r.name, online: onlineOf(r) })),
     outgoing: outgoing.rows.map((r) => ({ id: r.id, kind: r.kind, toTag: r.tag, toName: r.name })),
-    match: match.rows[0] ? { id: match.rows[0].id, foeName: match.rows[0].name, foeTag: match.rows[0].tag, status: match.rows[0].status } : null,
+    match: row ? {
+      id: row.id,
+      foeName: row.name,
+      foeTag: row.tag,
+      status: row.status,
+      youReady: Boolean(youA ? row.a_ready : row.b_ready),
+      foeReady: Boolean(youA ? row.b_ready : row.a_ready),
+    } : null,
   };
 }
 
 async function findByTag(tag) {
   const { rows } = await pool.query("SELECT id, name, tag, last_seen_at FROM users WHERE tag = $1", [String(tag || "").toUpperCase()]);
   return rows[0] || null;
+}
+
+async function currentMatch(user) {
+  const { rows } = await pool.query(
+    `SELECT m.*, ua.name AS name_a, ub.name AS name_b
+     FROM matches m
+     JOIN users ua ON ua.id = m.a_id
+     JOIN users ub ON ub.id = m.b_id
+     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status IN ('found', 'live')
+       AND m.created_at > now() - interval '30 minutes'
+     ORDER BY m.created_at DESC LIMIT 1`,
+    [user.id],
+  );
+  return rows[0] || null;
+}
+
+function tableView(user, row, actions = []) {
+  if (!row) return { match: null };
+  const youA = row.a_id === user.id;
+  const deck = (value) => Array.isArray(value) ? value : [];
+  return {
+    match: {
+      id: row.id,
+      status: row.status,
+      you: youA ? "a" : "b",
+      foeName: youA ? row.name_b : row.name_a,
+      foeTag: "",
+      aName: row.name_a,
+      bName: row.name_b,
+      seed: row.seed || 0,
+      first: row.first_seat || "a",
+      yourDeck: deck(youA ? row.a_deck : row.b_deck),
+      foeDeck: deck(youA ? row.b_deck : row.a_deck),
+      youReady: Boolean(youA ? row.a_deck : row.b_deck),
+      foeReady: Boolean(youA ? row.b_deck : row.a_deck),
+      seq: row.seq || 0,
+      actions,
+    },
+  };
 }
 
 async function handleSocial(req, res, p) {
@@ -594,6 +659,55 @@ async function handleSocial(req, res, p) {
       await pool.query("INSERT INTO matches (id, a_id, b_id) VALUES ($1,$2,$3)", [newId("match"), inv.from_id, user.id]);
     }
     return json(res, 200, await socialState(user));
+  }
+  if (p === "/v1/social/ready") {
+    const row = await currentMatch(user);
+    if (!row) return json(res, 404, { error: "No hay una sala abierta." });
+    const deck = Array.isArray(body.deck) ? body.deck.map((id) => String(id)).slice(0, 60) : [];
+    if (deck.length !== 60) return json(res, 400, { error: "La baraja tiene que tener 60 cartas." });
+    const youA = row.a_id === user.id;
+    await pool.query(
+      `UPDATE matches SET ${youA ? "a_deck" : "b_deck"} = $2::jsonb WHERE id = $1`,
+      [row.id, JSON.stringify(deck)],
+    );
+    const fresh = await currentMatch(user);
+    if (fresh && fresh.a_deck && fresh.b_deck && fresh.status === "found") {
+      const seed = crypto.randomInt(1, 2147483646);
+      const first = crypto.randomInt(2) === 0 ? "a" : "b";
+      await pool.query(
+        `UPDATE matches SET status = 'live', seed = $2, first_seat = $3 WHERE id = $1 AND status = 'found'`,
+        [fresh.id, seed, first],
+      );
+    }
+    return json(res, 200, tableView(user, await currentMatch(user)));
+  }
+  if (p === "/v1/social/act") {
+    const row = await currentMatch(user);
+    if (!row || row.status !== "live") return json(res, 409, { error: "La mesa todavía no está." });
+    if (!body.action || typeof body.action !== "object") return json(res, 400, { error: "Falta la jugada." });
+    const seat = row.a_id === user.id ? "a" : "b";
+    const updated = await pool.query(
+      `UPDATE matches SET seq = seq + 1 WHERE id = $1 AND status = 'live' RETURNING seq`,
+      [row.id],
+    );
+    const seq = updated.rows[0]?.seq;
+    if (!seq) return json(res, 409, { error: "La mesa ya se cerró." });
+    await pool.query(
+      "INSERT INTO match_acts (match_id, seq, seat, payload) VALUES ($1,$2,$3,$4)",
+      [row.id, seq, seat, JSON.stringify(body.action)],
+    );
+    return json(res, 200, { ok: true, seq });
+  }
+  if (p === "/v1/social/table") {
+    const row = await currentMatch(user);
+    if (!row) return json(res, 200, { match: null });
+    const since = Math.max(0, Math.floor(Number(body.since) || 0));
+    const acts = await pool.query(
+      `SELECT seq, payload FROM match_acts WHERE match_id = $1 AND seq > $2 ORDER BY seq ASC`,
+      [row.id, since],
+    );
+    const actions = acts.rows.map((act) => ({ seq: act.seq, action: act.payload }));
+    return json(res, 200, tableView(user, row, actions));
   }
   if (p === "/v1/social/queue") {
     if (!body.join) {
