@@ -471,7 +471,7 @@ async function ensureTag(user) {
 
 function onlineOf(row) {
   const seen = row.last_seen_at ? new Date(row.last_seen_at).getTime() : 0;
-  return Date.now() - seen < 20000;
+  return Date.now() - seen < 45000;
 }
 
 async function socialState(user) {
@@ -486,18 +486,29 @@ async function socialState(user) {
      WHERE i.to_id = $1 AND i.status = 'pending' AND i.created_at > now() - interval '10 minutes' ORDER BY i.created_at DESC`,
     [user.id],
   );
+  const outgoing = await pool.query(
+    `SELECT i.id, i.kind, u.name, u.tag FROM invites i JOIN users u ON u.id = i.to_id
+     WHERE i.from_id = $1 AND i.status = 'pending' AND i.created_at > now() - interval '10 minutes' ORDER BY i.created_at DESC`,
+    [user.id],
+  );
   const match = await pool.query(
     `SELECT m.id, m.status, u.name, u.tag FROM matches m
      JOIN users u ON u.id = CASE WHEN m.a_id = $1 THEN m.b_id ELSE m.a_id END
-     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status = 'found' AND m.created_at > now() - interval '30 minutes'
+     WHERE (m.a_id = $1 OR m.b_id = $1) AND m.status = 'found' AND m.created_at > now() - interval '10 minutes'
      ORDER BY m.created_at DESC LIMIT 1`,
     [user.id],
   );
-  const me = (await pool.query("SELECT tag, name FROM users WHERE id = $1", [user.id])).rows[0] || {};
+  const me = (await pool.query("SELECT tag, name, queue_at FROM users WHERE id = $1", [user.id])).rows[0] || {};
+  const searching = await pool.query(
+    `SELECT count(*)::int AS n FROM users WHERE queue_at IS NOT NULL AND last_seen_at > now() - interval '45 seconds'`,
+  );
   return {
     me: { tag: me.tag || "", name: me.name || "" },
+    queued: Boolean(me.queue_at),
+    searching: searching.rows[0]?.n || 0,
     friends: friends.rows.map((r) => ({ tag: r.tag, name: r.name, online: onlineOf(r) })),
     invites: invites.rows.map((r) => ({ id: r.id, kind: r.kind, fromTag: r.tag, fromName: r.name, online: onlineOf(r) })),
+    outgoing: outgoing.rows.map((r) => ({ id: r.id, kind: r.kind, toTag: r.tag, toName: r.name })),
     match: match.rows[0] ? { id: match.rows[0].id, foeName: match.rows[0].name, foeTag: match.rows[0].tag, status: match.rows[0].status } : null,
   };
 }
@@ -537,9 +548,34 @@ async function handleSocial(req, res, p) {
       const already = await pool.query("SELECT 1 FROM friends WHERE user_id = $1 AND other_id = $2", [user.id, other.id]);
       if (already.rows.length) return json(res, 409, { error: "Ya está en tu lista." });
     }
-    const id = newId("inv");
-    await pool.query("INSERT INTO invites (id, from_id, to_id, kind) VALUES ($1,$2,$3,$4)", [id, user.id, other.id, kind]);
-    return json(res, 200, { ok: true, ...(await socialState(user)) });
+    const pending = await pool.query(
+      `SELECT id FROM invites WHERE from_id = $1 AND to_id = $2 AND kind = $3 AND status = 'pending' AND created_at > now() - interval '10 minutes'`,
+      [user.id, other.id, kind],
+    );
+    if (!pending.rows.length) {
+      await pool.query("INSERT INTO invites (id, from_id, to_id, kind) VALUES ($1,$2,$3,$4)", [newId("inv"), user.id, other.id, kind]);
+    }
+    return json(res, 200, { ok: true, sent: true, ...(await socialState(user)) });
+  }
+  if (p === "/v1/social/remove") {
+    const other = await findByTag(body.tag);
+    if (!other) return json(res, 404, { error: "No hay un jugador con ese ID." });
+    await pool.query(
+      "DELETE FROM friends WHERE (user_id = $1 AND other_id = $2) OR (user_id = $2 AND other_id = $1)",
+      [user.id, other.id],
+    );
+    await pool.query(
+      `UPDATE invites SET status = 'cancelled' WHERE status = 'pending' AND ((from_id = $1 AND to_id = $2) OR (from_id = $2 AND to_id = $1))`,
+      [user.id, other.id],
+    );
+    return json(res, 200, await socialState(user));
+  }
+  if (p === "/v1/social/cancel") {
+    await pool.query(
+      "UPDATE invites SET status = 'cancelled' WHERE id = $1 AND from_id = $2 AND status = 'pending'",
+      [String(body.id || ""), user.id],
+    );
+    return json(res, 200, await socialState(user));
   }
   if (p === "/v1/social/answer") {
     const { rows } = await pool.query(
@@ -562,16 +598,40 @@ async function handleSocial(req, res, p) {
   if (p === "/v1/social/queue") {
     if (!body.join) {
       await pool.query("UPDATE users SET queue_at = NULL WHERE id = $1", [user.id]);
+      if (body.close) {
+        await pool.query(
+          `UPDATE matches SET status = 'closed' WHERE status = 'found' AND (a_id = $1 OR b_id = $1)`,
+          [user.id],
+        );
+      }
       return json(res, 200, await socialState(user));
     }
-    await pool.query("UPDATE users SET queue_at = now(), last_seen_at = now() WHERE id = $1", [user.id]);
-    const other = await pool.query(
-      `SELECT id FROM users WHERE queue_at IS NOT NULL AND id <> $1 AND last_seen_at > now() - interval '20 seconds' ORDER BY queue_at ASC LIMIT 1`,
-      [user.id],
-    );
-    if (other.rows[0]) {
-      await pool.query("UPDATE users SET queue_at = NULL WHERE id = $1 OR id = $2", [user.id, other.rows[0].id]);
-      await pool.query("INSERT INTO matches (id, a_id, b_id) VALUES ($1,$2,$3)", [newId("match"), user.id, other.rows[0].id]);
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("UPDATE users SET queue_at = now(), last_seen_at = now() WHERE id = $1", [user.id]);
+      const other = await client.query(
+        `SELECT id FROM users
+         WHERE queue_at IS NOT NULL AND id <> $1 AND last_seen_at > now() - interval '45 seconds'
+           AND NOT EXISTS (
+             SELECT 1 FROM matches m WHERE m.status = 'found' AND m.created_at > now() - interval '10 minutes'
+               AND (m.a_id = users.id OR m.b_id = users.id)
+           )
+         ORDER BY queue_at ASC
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED`,
+        [user.id],
+      );
+      if (other.rows[0]) {
+        await client.query("UPDATE users SET queue_at = NULL WHERE id = $1 OR id = $2", [user.id, other.rows[0].id]);
+        await client.query("INSERT INTO matches (id, a_id, b_id) VALUES ($1,$2,$3)", [newId("match"), user.id, other.rows[0].id]);
+      }
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
     }
     return json(res, 200, await socialState(user));
   }
