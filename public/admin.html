@@ -70,6 +70,7 @@
         <h2>Usuarios</h2>
         <div class="row"><input id="userQ" placeholder="Buscar email o nombre" /><button id="btnSearch">Buscar</button></div>
         <div style="overflow:auto"><table id="userTable"></table></div>
+        <p id="resetBox" class="codes" style="margin-top:12px"></p>
       </section>
       <section data-panel="codigos" class="card hidden">
         <h2>Códigos de bundle</h2>
@@ -123,7 +124,7 @@ async function loadUsers() {
   const q = $("userQ").value.trim();
   const r = await api("/v1/admin/users" + (q ? `?q=${encodeURIComponent(q)}` : "")); if (!r.ok) return;
   $("userTable").innerHTML = "<tr><th>Email</th><th>Nombre</th><th>Rol</th><th>Estado</th><th></th></tr>" +
-    r.data.users.map((u) => `<tr><td>${u.email}</td><td>${u.name}</td><td>${u.role}</td><td><span class="pill ${u.banned?"off":"on"}">${u.banned?"ban":"ok"}</span></td><td>${u.role==="admin"?"":u.banned?`<button data-unban="${u.id}">Quitar ban</button>`:`<button class="danger" data-ban="${u.id}">Ban</button>`} ${u.role==="admin"?"":`<button class="ghost" data-del="${u.id}">Borrar</button>`}</td></tr>`).join("");
+    r.data.users.map((u) => `<tr><td>${u.email}</td><td>${u.name}</td><td>${u.role}</td><td><span class="pill ${u.banned?"off":"on"}">${u.banned?"ban":"ok"}</span></td><td>${u.role==="admin"?"":u.banned?`<button data-unban="${u.id}">Quitar ban</button>`:`<button class="danger" data-ban="${u.id}">Ban</button>`} ${u.role==="admin"?"":`<button class="ghost" data-reset="${u.id}">Resetear</button>`} ${u.role==="admin"?"":`<button class="ghost" data-del="${u.id}">Borrar</button>`}</td></tr>`).join("");
 }
 async function loadCodes() {
   const r = await api("/v1/admin/codes"); if (!r.ok) return;
@@ -172,6 +173,16 @@ document.body.addEventListener("click", async (e) => {
     if (!confirm("Se borra la cuenta y su buzón. Podrá registrarse otra vez.")) return;
     await api(`/v1/admin/users/${e.target.dataset.del}/delete`, { method:"POST", body:"{}" });
     loadUsers();
+  }
+  if (e.target.dataset.reset) {
+    const r = await api(`/v1/admin/users/${e.target.dataset.reset}/reset`, { method:"POST", body:"{}" });
+    if (r.ok) {
+      const box = $("resetBox");
+      box.innerHTML = `<strong>Enlace para ${r.data.email}</strong><br>${r.data.resetUrl}<br><small>Válido 1 hora. Cópialo y envíaselo.</small>`;
+      navigator.clipboard?.writeText(r.data.resetUrl).catch(() => {});
+    } else {
+      $("resetBox").textContent = r.data.error || "No se pudo generar el enlace.";
+    }
   }
 });
 boot();
